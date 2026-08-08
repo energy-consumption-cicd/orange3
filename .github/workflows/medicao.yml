@@ -68,7 +68,54 @@ jobs:
         if: ${{ inputs.campaign == 'validacao' }}
         run: |
           RESULTS_DIR="$HOME/experimentos/medicao/resultados/orange3/runs"
-          bash "$HOME/experimentos/medicao/repositorios/orange3/run_pipeline.sh" 0
+
+          # Cópia LITERAL da validar_csv do step "Executar 10 runs de medição".
+          # Duplicada de propósito: cada `run:` do Actions é um shell próprio e
+          # funções não atravessam steps. Se uma mudar, a outra tem de mudar junto.
+          validar_csv() {
+            local csv="$1"
+            [ -f "$csv" ] || return 1
+            awk -F, '
+              NR==1 { next }
+              $2=="build"||$2=="test"||$2=="total" {
+                seen[$2]=1
+                if ($3==""||$4==""||$7=="" || $3+0<=0 || $4+0<=0 || $7+0<=0) inval[$2]=1
+              }
+              END {
+                split("build test total", req, " ")
+                for (i in req) {
+                  s=req[i]
+                  if (!(s in seen)) exit 1
+                  if (s in inval)   exit 1
+                }
+                exit 0
+              }
+            ' "$csv"
+          }
+
+          # ─── D-8 (2026-08-08): FALHA DO WORKLOAD ≠ FALHA DA MEDIÇÃO ─────────
+          #
+          # O step roda sob `bash -e`. Antes desta correção, o exit 1 do
+          # run_pipeline.sh matava o step AQUI, e tudo o que vem abaixo — o `mv`
+          # para runs/validacao/ e os dois sanity checks — era silenciosamente
+          # pulado. Foi o que aconteceu no job 92987000108: o CSV ficou em
+          # runs/run_00.csv, runs/validacao/ nunca foi criado, e nenhum
+          # ::warning:: de (user+sys)/wall foi emitido apesar do ratio anômalo.
+          #
+          # No orange3 o exit != 0 é PERMANENTE POR DESIGN (D-2): os 4 erros de
+          # Orange/tests/test_url_reader.py sob --network none acontecem em toda
+          # run. Deixar isso derrubar o step significa que NENHUMA run do orange3
+          # chega ao fim do step — em campaign=completa, o loop abortaria na run 1
+          # e a campanha terminaria com 1 medição em vez de 10.
+          #
+          # `|| PIPELINE_EXIT=$?` captura o código SEM engolir: ele é testado
+          # abaixo e vira ::warning::. Não é `|| true` — o valor é preservado.
+          # O sidecar exit_codes_run_00.txt continua registrando o código real de
+          # cada stage, que é o registro de veracidade do estudo.
+          PIPELINE_EXIT=0
+          bash "$HOME/experimentos/medicao/repositorios/orange3/run_pipeline.sh" 0 \
+            || PIPELINE_EXIT=$?
+
           # run 0 é smoke test: mover run_00.csv para fora de runs/ para não
           # entrar na agregação da mediana (aggregate.py globa runs/run_*.csv)
           mkdir -p "$RESULTS_DIR/validacao"
@@ -76,6 +123,23 @@ jobs:
             mv -f "$RESULTS_DIR/run_00.csv" "$RESULTS_DIR/validacao/run_00.csv"
             echo "ℹ️  run_00.csv movido para runs/validacao/ (não conta para os resultados)"
           fi
+
+          # ─── GATE DE MEDIÇÃO ────────────────────────────────────────────────
+          # É AQUI que o job pode falhar, e só aqui: CSV ausente, linha
+          # malformada, ou energy_pkg_j/energy_cores_j/wall_time_s zerados ou
+          # vazios — isto é, container que não subiu, RAPL ilegível, escrita do
+          # CSV interrompida. Falha de MEDIÇÃO. O exit code do workload não entra
+          # nesta decisão. Vem antes dos awk porque eles leem o mesmo arquivo:
+          # sem o gate, um CSV ausente viraria um erro obscuro do awk.
+          if ! validar_csv "$RESULTS_DIR/validacao/run_00.csv"; then
+            echo "::error title=Falha de medição::run 0: CSV ausente ou inválido em runs/validacao/run_00.csv (pipeline exit=$PIPELINE_EXIT). Energia e/ou wall não foram medidos — isto NÃO é a falha esperada do workload."
+            exit 1
+          fi
+          if [ "$PIPELINE_EXIT" -ne 0 ]; then
+            echo "::warning title=Workload com exit não-zero::run 0: run_pipeline.sh saiu com exit=$PIPELINE_EXIT. Esperado no orange3 (D-2): 4 erros de Orange/tests/test_url_reader.py sob --network none, em toda run. CSV válido — medição CONTABILIZADA. Códigos por stage em runs/exit_codes_run_00.txt."
+          fi
+          echo "✅ run 0: medição válida (exit do workload=$PIPELINE_EXIT)"
+
           # Sanity check não bloqueante de user/sys (ver alertar_user_sys no modo completa).
           # ORANGE3: espera-se ratio > 0.5 nos DOIS stages — alerta é sinal REAL.
           awk -F, '
@@ -206,8 +270,17 @@ jobs:
             echo "::group::Warm-up (descartado da análise)"
             echo "🔥 $PENDENTES run(s) pendente(s) — executando warm-up antes dos runs oficiais"
             mkdir -p "$RESULTS_DIR/warmup"
-            bash "$PIPELINE" 0
+            # D-8: exit != 0 do workload é esperado (D-2) e não aborta o warm-up.
+            WARMUP_EXIT=0
+            bash "$PIPELINE" 0 || WARMUP_EXIT=$?
+            if [ ! -f "$RESULTS_DIR/run_00.csv" ]; then
+              echo "::error title=Falha de medição::warm-up: run_pipeline.sh (exit=$WARMUP_EXIT) não escreveu run_00.csv — falha de medição, não do workload."
+              exit 1
+            fi
             mv -f "$RESULTS_DIR/run_00.csv" "$RESULTS_DIR/warmup/run_warmup.csv"
+            if [ "$WARMUP_EXIT" -ne 0 ]; then
+              echo "::warning title=Workload com exit não-zero::warm-up: run_pipeline.sh saiu com exit=$WARMUP_EXIT (esperado no orange3 — D-2). Warm-up é descartado da análise de qualquer forma."
+            fi
             alertar_user_sys "$RESULTS_DIR/warmup/run_warmup.csv" "warm-up"
             alertar_swap "$RESULTS_DIR/warmup/run_warmup.csv" "warm-up"
             {
@@ -241,9 +314,29 @@ jobs:
               echo "▶️  Run $NN ausente — executando"
               echo "- Run $NN: ausente — **executada**" >> "$GITHUB_STEP_SUMMARY"
             fi
-            bash "$PIPELINE" "$i"
+            # ─── D-8: o loop TOLERA exit != 0 do workload ────────────────────
+            # Sem isto o `bash -e` aborta o loop na run 1 (o orange3 sai != 0 em
+            # TODA run, por design — D-2) e a campanha entrega 1 medição de 10.
+            # O código é capturado, não engolido: vira ::warning:: abaixo e
+            # continua registrado por stage no sidecar exit_codes_run_NN.txt.
+            RUN_EXIT=0
+            bash "$PIPELINE" "$i" || RUN_EXIT=$?
             alertar_user_sys "$CSV" "run $NN"
             alertar_swap "$CSV" "run $NN"
+            # Gate de MEDIÇÃO: aqui, e só aqui, o job falha. CSV ausente ou com
+            # energia/wall zerados significa container que não subiu, RAPL
+            # ilegível ou escrita interrompida — a campanha não tem como
+            # prosseguir e para na hora, em vez de gastar horas nas runs
+            # seguintes com a mesma infraestrutura quebrada.
+            if ! validar_csv "$CSV"; then
+              echo "::error title=Falha de medição::run $NN: CSV ausente ou inválido após o pipeline (exit=$RUN_EXIT). Energia e/ou wall não foram medidos — campanha abortada."
+              echo "- Run $NN: **FALHA DE MEDIÇÃO** (pipeline exit=$RUN_EXIT) — campanha abortada" >> "$GITHUB_STEP_SUMMARY"
+              exit 1
+            fi
+            if [ "$RUN_EXIT" -ne 0 ]; then
+              echo "::warning title=Workload com exit não-zero::run $NN: run_pipeline.sh saiu com exit=$RUN_EXIT. Esperado no orange3 (D-2): 4 erros de test_url_reader sob --network none. CSV válido — run CONTABILIZADA."
+              echo "- Run $NN: workload exit=$RUN_EXIT (esperado, D-2) — CSV válido, **contabilizada**" >> "$GITHUB_STEP_SUMMARY"
+            fi
             echo "::endgroup::"
             if [ "$i" -lt 10 ]; then
               echo "⏳ Repouso entre runs (120s)..."
@@ -257,6 +350,25 @@ jobs:
             alertar_user_sys "$RESULTS_DIR/run_${NN}.csv" "run $NN"
             alertar_swap "$RESULTS_DIR/run_${NN}.csv" "run $NN"
           done
+
+          # ─── Pré-condição EXPLÍCITA do step de medianas ─────────────────────
+          # O step "Calcular medianas" só roda se ESTE step terminar com sucesso
+          # (comportamento padrão do Actions — sem `if: always()` lá). Antes do
+          # D-8 essa garantia vinha de graça do `bash -e`; agora que o exit do
+          # workload é tolerado, ela precisa ser afirmada, e não inferida.
+          # Sem isto, um CSV inválido numa run pulada pelo skip-if-exists
+          # chegaria ao aggregate.py e produziria mediana sobre menos de 10 runs.
+          INVALIDAS=""
+          for i in $(seq 1 10); do
+            NN=$(printf '%02d' "$i")
+            validar_csv "$RESULTS_DIR/run_${NN}.csv" || INVALIDAS="${INVALIDAS:+$INVALIDAS }$NN"
+          done
+          if [ -n "$INVALIDAS" ]; then
+            echo "::error title=Campanha incompleta::runs com CSV ausente ou inválido: $INVALIDAS — as medianas NÃO serão calculadas."
+            echo "- **Campanha incompleta** — runs inválidas: $INVALIDAS" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "✅ 10 runs com CSV válido — pré-condição do aggregate.py satisfeita"
 
       - name: Calcular medianas (após run 10)
         if: ${{ inputs.campaign == 'completa' }}
