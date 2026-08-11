@@ -102,11 +102,17 @@ jobs:
           # runs/run_00.csv, runs/validacao/ nunca foi criado, e nenhum
           # ::warning:: de (user+sys)/wall foi emitido apesar do ratio anômalo.
           #
-          # No orange3 o exit != 0 é PERMANENTE POR DESIGN (D-2): os 4 erros de
-          # Orange/tests/test_url_reader.py sob --network none acontecem em toda
-          # run. Deixar isso derrubar o step significa que NENHUMA run do orange3
-          # chega ao fim do step — em campaign=completa, o loop abortaria na run 1
-          # e a campanha terminaria com 1 medição em vez de 10.
+          # ATUALIZADO 2026-08-11 — a D-2 está SUPERADA. Até 2026-08-10 o exit
+          # != 0 era permanente por design (os 4 erros de test_url_reader.py sob
+          # --network none). Com o pré-cozimento dos datasets de biolab.si, o
+          # stage `test` passa a sair 0.
+          #
+          # A tolerância continua NECESSÁRIA, por outro motivo: o SIGABRT latente
+          # do PyQt5 (exit 134, ~14% das runs) produziria um `bash -e` matando o
+          # step no meio, e com ele o `mv`, os sanity checks e — em
+          # campaign=completa — as runs seguintes. Capturar o código em vez de
+          # morrer é o que permite REGISTRAR a run inválida e seguir; a decisão
+          # sobre rejeitá-la é da regra de exit code, não do `bash -e`.
           #
           # `|| PIPELINE_EXIT=$?` captura o código SEM engolir: ele é testado
           # abaixo e vira ::warning::. Não é `|| true` — o valor é preservado.
@@ -136,7 +142,7 @@ jobs:
             exit 1
           fi
           if [ "$PIPELINE_EXIT" -ne 0 ]; then
-            echo "::warning title=Workload com exit não-zero::run 0: run_pipeline.sh saiu com exit=$PIPELINE_EXIT. Esperado no orange3 (D-2): 4 erros de Orange/tests/test_url_reader.py sob --network none, em toda run. CSV válido — medição CONTABILIZADA. Códigos por stage em runs/exit_codes_run_00.txt."
+            echo "::warning title=Exit code fora do esperado::run 0: run_pipeline.sh saiu com exit=$PIPELINE_EXIT, mas o esperado no orange3 é 0 em todos os stages (desde o pré-cozimento de 2026-08-10). exit=134 é o SIGABRT latente do PyQt5 em test_owscatterplotbase (~14% das runs): trunca a suíte em ~96% e não produz coverage.xml — run INVÁLIDA, deve ser reposta. Qualquer outro código merece investigação. Códigos por stage em runs/exit_codes_run_00.txt."
           fi
           echo "✅ run 0: medição válida (exit do workload=$PIPELINE_EXIT)"
 
@@ -171,12 +177,20 @@ jobs:
           # críticas (energy_pkg_j, energy_cores_j, wall_time_s) não-vazias e > 0.
           # user_time_s/sys_time_s NÃO entram na validação (não usados na análise).
           #
-          # NOTA (D-2): a validação NÃO olha exit code, e isso é deliberado no
-          # orange3. O stage `test` sai não-zero em TODA run, por design: os
-          # 6 acessos de Orange/tests/test_url_reader.py a datasets.biolab.si não
-          # têm skipIf nem mock, e 4 falham sob --network none. A run continua
-          # VÁLIDA — o que importa é que energia e wall foram medidos. Os exit
-          # codes ficam no sidecar exit_codes_run_NN.txt para auditoria.
+          # NOTA: `validar_csv` NÃO olha exit code, e isso permanece deliberado —
+          # mas o motivo mudou em 2026-08-11. Antes era porque o `test` saía
+          # não-zero em TODA run (D-2, hoje SUPERADA pelo pré-cozimento). Agora é
+          # separação de responsabilidades: esta função responde "a MEDIÇÃO
+          # aconteceu?" (energia e wall foram gravados), que é o que decide se o
+          # job falha. "O WORKLOAD foi o certo?" é a pergunta do exit code, e a
+          # resposta dela rejeita a RUN, não o job.
+          #
+          # A regra de rejeição por exit code está congelada em
+          # infraestrutura/revisao_metodologica.md (seção "Códigos de saída
+          # aceitáveis"), datada ANTES desta campanha. Ela ainda NÃO está
+          # implementada aqui: a conferência do sidecar exit_codes_run_NN.txt
+          # contra {0} é manual, no pós-campanha. Os códigos ficam registrados
+          # por stage no sidecar para essa auditoria.
           validar_csv() {
             local csv="$1"
             [ -f "$csv" ] || return 1
@@ -270,7 +284,9 @@ jobs:
             echo "::group::Warm-up (descartado da análise)"
             echo "🔥 $PENDENTES run(s) pendente(s) — executando warm-up antes dos runs oficiais"
             mkdir -p "$RESULTS_DIR/warmup"
-            # D-8: exit != 0 do workload é esperado (D-2) e não aborta o warm-up.
+            # D-8: exit != 0 do workload não aborta o warm-up. Desde o
+            # pré-cozimento o esperado é 0; a tolerância existe para o SIGABRT
+            # latente (134) não matar o step antes do `mv`.
             WARMUP_EXIT=0
             bash "$PIPELINE" 0 || WARMUP_EXIT=$?
             if [ ! -f "$RESULTS_DIR/run_00.csv" ]; then
@@ -279,7 +295,7 @@ jobs:
             fi
             mv -f "$RESULTS_DIR/run_00.csv" "$RESULTS_DIR/warmup/run_warmup.csv"
             if [ "$WARMUP_EXIT" -ne 0 ]; then
-              echo "::warning title=Workload com exit não-zero::warm-up: run_pipeline.sh saiu com exit=$WARMUP_EXIT (esperado no orange3 — D-2). Warm-up é descartado da análise de qualquer forma."
+              echo "::warning title=Exit code fora do esperado::warm-up: run_pipeline.sh saiu com exit=$WARMUP_EXIT; o esperado é 0. O warm-up é descartado da análise de qualquer forma, então isto não invalida a campanha — mas exit=134 aqui é indício de que o SIGABRT do PyQt5 está ativo nesta sessão, e vale acompanhar as runs oficiais de perto."
             fi
             alertar_user_sys "$RESULTS_DIR/warmup/run_warmup.csv" "warm-up"
             alertar_swap "$RESULTS_DIR/warmup/run_warmup.csv" "warm-up"
@@ -315,10 +331,13 @@ jobs:
               echo "- Run $NN: ausente — **executada**" >> "$GITHUB_STEP_SUMMARY"
             fi
             # ─── D-8: o loop TOLERA exit != 0 do workload ────────────────────
-            # Sem isto o `bash -e` aborta o loop na run 1 (o orange3 sai != 0 em
-            # TODA run, por design — D-2) e a campanha entrega 1 medição de 10.
-            # O código é capturado, não engolido: vira ::warning:: abaixo e
-            # continua registrado por stage no sidecar exit_codes_run_NN.txt.
+            # Desde o pré-cozimento (2026-08-10) o esperado é exit 0, mas a
+            # tolerância CONTINUA necessária: sem ela, uma run que caia no
+            # SIGABRT latente do PyQt5 (134, ~14%) mataria o `bash -e` e levaria
+            # junto as runs seguintes — trocaria 1 run a repor por uma campanha
+            # inteira a refazer. O código é capturado, não engolido: vira
+            # ::warning:: abaixo e fica registrado por stage no sidecar
+            # exit_codes_run_NN.txt, que é o que a auditoria pós-campanha lê.
             RUN_EXIT=0
             bash "$PIPELINE" "$i" || RUN_EXIT=$?
             alertar_user_sys "$CSV" "run $NN"
@@ -334,8 +353,8 @@ jobs:
               exit 1
             fi
             if [ "$RUN_EXIT" -ne 0 ]; then
-              echo "::warning title=Workload com exit não-zero::run $NN: run_pipeline.sh saiu com exit=$RUN_EXIT. Esperado no orange3 (D-2): 4 erros de test_url_reader sob --network none. CSV válido — run CONTABILIZADA."
-              echo "- Run $NN: workload exit=$RUN_EXIT (esperado, D-2) — CSV válido, **contabilizada**" >> "$GITHUB_STEP_SUMMARY"
+              echo "::warning title=Exit code fora do esperado::run $NN: run_pipeline.sh saiu com exit=$RUN_EXIT, mas o esperado no orange3 é 0 em todos os stages. exit=134 é o SIGABRT latente do PyQt5 em test_owscatterplotbase (~14% das runs): trunca a suíte em ~96% e não produz coverage.xml. Pela regra congelada em revisao_metodologica.md, esta run deve ser REJEITADA e REPOSTA. O CSV foi preservado e o aggregate.py ainda o contabiliza — a exclusão é MANUAL no pós-campanha."
+              echo "- Run $NN: workload exit=$RUN_EXIT — **fora do esperado (0)**. Run a REJEITAR e REPOR; CSV preservado, exclusão manual (o aggregate.py ainda o conta)" >> "$GITHUB_STEP_SUMMARY"
             fi
             echo "::endgroup::"
             if [ "$i" -lt 10 ]; then
