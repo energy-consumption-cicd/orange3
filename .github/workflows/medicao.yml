@@ -189,6 +189,36 @@ jobs:
           # Garantir que nenhum run_00.csv de validação polua a mediana
           rm -f "$RESULTS_DIR/run_00.csv"
 
+          # ─── PROVENIÊNCIA TEMPORAL (2026-08-11) ─────────────────────────────
+          # Registra a ORDEM REAL de execução, que o conjunto final não preserva
+          # sozinho: pela regra E.4, uma run rejeitada é reposta reexecutando o
+          # MESMO número, então `run_03` pode ter sido a última a rodar.
+          #
+          # Isso não afeta a mediana, mas afeta três análises previstas:
+          # convergência da mediana run-a-run (o argumento que sustenta n=10
+          # contra a convenção de 30), estacionariedade do baseline ao longo da
+          # campanha, e detecção de padrões de anomalia de wall_time (no yolov5 o
+          # padrão foi "a cada 3 runs", visível só com a ordem real).
+          #
+          # POR QUE AQUI, e não no run_pipeline.sh: o script de medição fica
+          # congelado às vésperas de campanha. Esta é a camada de ORQUESTRAÇÃO —
+          # ela já sabe a ordem, basta escrevê-la. As colunas do CSV oficial
+          # também não são tocadas: são 13, comuns aos 6 projetos e consumidas
+          # pelo aggregate.py; acrescentar uma só no orange3 quebraria a
+          # agregação. Daí o sidecar.
+          #
+          # NOME: `ordem_execucao.txt` NÃO casa com o glob `run_*.csv` do
+          # aggregate.py — mesma precaução do `exit_codes_run_NN.txt`.
+          #
+          # APPEND-ONLY, nunca truncado: se a campanha for reexecutada, as
+          # linhas se acumulam, e isso é o comportamento certo — o arquivo
+          # registra o que ACONTECEU, não o que sobrou.
+          ORDEM="$RESULTS_DIR/ordem_execucao.txt"
+          if [ ! -f "$ORDEM" ]; then
+            echo "# ordem real de execução (append-only) — run,inicio_utc,fim_utc,exit,origem" > "$ORDEM"
+          fi
+          agora_utc() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+
           # Valida run_NN.csv: 3 stages (build/test/total) presentes e colunas
           # críticas (energy_pkg_j, energy_cores_j, wall_time_s) não-vazias e > 0.
           # user_time_s/sys_time_s NÃO entram na validação (não usados na análise).
@@ -304,7 +334,9 @@ jobs:
             # pré-cozimento o esperado é 0; a tolerância existe para o SIGABRT
             # latente (134) não matar o step antes do `mv`.
             WARMUP_EXIT=0
+            T_INI=$(agora_utc)
             bash "$PIPELINE" 0 || WARMUP_EXIT=$?
+            echo "00,$T_INI,$(agora_utc),$WARMUP_EXIT,warmup" >> "$ORDEM"
             if [ ! -f "$RESULTS_DIR/run_00.csv" ]; then
               echo "::error title=Falha de medição::warm-up: run_pipeline.sh (exit=$WARMUP_EXIT) não escreveu run_00.csv — falha de medição, não do workload."
               exit 1
@@ -355,7 +387,9 @@ jobs:
             # ::warning:: abaixo e fica registrado por stage no sidecar
             # exit_codes_run_NN.txt, que é o que a auditoria pós-campanha lê.
             RUN_EXIT=0
+            T_INI=$(agora_utc)
             bash "$PIPELINE" "$i" || RUN_EXIT=$?
+            echo "$NN,$T_INI,$(agora_utc),$RUN_EXIT,campanha" >> "$ORDEM"
             alertar_user_sys "$CSV" "run $NN"
             alertar_swap "$CSV" "run $NN"
             # Gate de MEDIÇÃO: aqui, e só aqui, o job falha. CSV ausente ou com
