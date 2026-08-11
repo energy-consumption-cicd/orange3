@@ -57,11 +57,27 @@ jobs:
             echo "   Build manual na tesla antes de disparar este workflow:"
             echo "   docker build -t orange3-medicao \\"
             echo "     -f ~/experimentos/medicao/repositorios/orange3/Dockerfile \\"
+            echo "     --build-context prebake=~/experimentos/medicao/repositorios/orange3/prebake/ \\"
             echo "     ~/experimentos/repositorios/inference-only/orange3/"
             exit 1
           fi
           echo "✅ Imagem Docker encontrada."
           docker image inspect orange3-medicao --format '{{.Created}}'
+
+          # GATE DE PRÉ-COZIMENTO. Sem isto, uma imagem construída SEM o
+          # --build-context (ou a :pre-prebake retagueada por engano) rodaria a
+          # campanha inteira medindo o workload antigo — 4 testes morrendo no
+          # DNS, exit 1 — e só se descobriria ao ler os exit codes no fim, 3h
+          # depois. O custo de errar aqui é uma campanha inteira.
+          if ! docker run --rm --network none orange3-medicao \
+                 test -f /opt/prebake/www/core/titanic.tab; then
+            echo "❌ A imagem 'orange3-medicao' NÃO tem o pré-cozimento dos datasets."
+            echo "   Esperado: /opt/prebake/www/core/titanic.tab presente."
+            echo "   Reconstrua com o --build-context prebake=... acima, ou promova"
+            echo "   a tag correta:  docker tag orange3-medicao:prebake orange3-medicao:latest"
+            exit 1
+          fi
+          echo "✅ Pré-cozimento presente (datasets de biolab.si embutidos)."
 
       # --- MODO validacao: apenas run 0, resultado não conta para a mediana ---
       - name: Run de validação (run 0)
