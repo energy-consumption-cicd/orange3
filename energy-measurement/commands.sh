@@ -3,7 +3,7 @@
 set -euo pipefail
 STAGE="${1:?stage required}"
 
-export ORANGE_DEPRECATIONS_ERRORR=y
+export ORANGE_DEPRECATIONS_ERROR=y
 export PYTHONWARNINGS=module
 export COVERAGE_FILE=/project/.coverage
 export COVERAGE_RCFILE=/project/.coveragerc
