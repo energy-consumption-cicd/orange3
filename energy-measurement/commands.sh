@@ -47,7 +47,7 @@ case "$STAGE" in
     coverage xml -o /project/coverage.xml || cov_exit=$?
 
     if [ "$local_test_exit" -ne 0 ]; then
-        echo "commands.sh: unittest saiu com $local_test_exit; coverage combine/report/xml executaram; propagando $local_test_exit" >&2
+        echo "commands.sh: unittest exited $local_test_exit; coverage combine/report/xml ran; propagating $local_test_exit" >&2
         exit "$local_test_exit"
     fi
     exit "$cov_exit"
